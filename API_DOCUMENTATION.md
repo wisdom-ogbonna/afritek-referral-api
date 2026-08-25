@@ -370,7 +370,7 @@ Authorization: Bearer <adminIdToken>
 Referral works in **two ways**:
 
 1. **Shareable Link** (recommended)  
-   User shares: `https://yourapp.com/signup?ref=JOHN4F2A`  
+   User shares: `https://yourapp.com/register?ref=JOHN4F2A`  
    Frontend extracts `ref` and sends it as `referralCode` during signup.
 
 2. **Manual code entry** during signup (still supported).
@@ -426,28 +426,61 @@ Authorization: Bearer <idToken>
   "message": "Referral stats retrieved successfully",
   "data": {
     "referralCode": "JOHN4F2A",
-    "referralLink": "http://localhost:3000/signup?ref=JOHN4F2A",
+    "referralLink": "https://afritek-web.vercel.app/register?ref=JOHN4F2A",
+    "referredBy": null,
     "balance": 15000,
-    "totalReferralEarnings": 15000,
+    "totalReferralEarnings": 40000,
     "directReferrals": 3,
     "secondLevelReferrals": 7,
+    "totalReferrals": 10,
     "level1Users": [
       {
         "uid": "...",
         "fullName": "Jane Doe",
-        "email": "jane@example.com",
+        "email": "ja***@example.com",
+        "level": 1,
+        "sharesOwned": 5,
+        "totalInvested": 100000,
+        "isVerified": true,
         "createdAt": "..."
       }
     ],
+    "level2Users": [
+      {
+        "uid": "...",
+        "fullName": "Sam Ade",
+        "email": "sa***@example.com",
+        "level": 2,
+        "sharesOwned": 2,
+        "totalInvested": 40000,
+        "isVerified": true,
+        "createdAt": "..."
+      }
+    ],
+    "earnings": {
+      "level1": 30000,
+      "level2": 10000,
+      "total": 40000
+    },
     "rates": {
       "level1": "15%",
-      "level2": "5%"
+      "level2": "5%",
+      "level1Percent": 15,
+      "level2Percent": 5
     }
   }
 }
 ```
 
-> **`referralLink`** is the ready-to-share link. Users just copy and share it.
+> **`referralLink`** is the ready-to-share link, built from `FRONTEND_URL` and the
+> frontend's `/register` route. Users just copy and share it.
+>
+> **`level2Users`** enumerates the second commission level, not just a count, so the
+> whole referral tree is visible in one call. Emails of other users are masked.
+>
+> **`earnings`** is derived from the `commissions` ledger, split per level;
+> `totalReferralEarnings` is the denormalised counter on the user document and
+> should match `earnings.total`.
 
 ---
 
@@ -513,106 +546,207 @@ Authorization: Bearer <idToken>
 
 ---
 
-### 7.3 Buy Shares
-Initiates payment with the selected gateway.
+### 7.3 Buy Shares — the single payment endpoint
 
 ```
 POST /shares/buy
 Authorization: Bearer <idToken>
 ```
 
-**Body**
+One endpoint handles the whole purchase for **all three gateways**. It has two
+modes, and you call it twice per purchase:
+
+| Mode | You send | It does |
+|---|---|---|
+| `initiate` | `quantity` + `gateway` | Creates a pending payment, returns what the gateway needs you to act on |
+| `verify` | `reference` | Confirms with the gateway, credits shares, pays referral commissions, updates the payment status |
+
+**Mode selection.** Send `action` explicitly, or leave it out and it is inferred:
+no `reference` means `initiate`, a `reference` means `verify`. All four of these
+are valid:
+
 ```json
-{
-  "quantity": 5,
-  "gateway": "paystack"
-}
+{ "quantity": 5, "gateway": "paystack" }                  // initiate
+{ "action": "initiate", "quantity": 5, "gateway": "paystack" }
+{ "reference": "SHR_7A903BE5FC8B45B8" }                   // verify
+{ "action": "verify", "reference": "SHR_7A903BE5FC8B45B8" }
 ```
 
-| Field    | Type   | Required | Allowed Values                  |
-|----------|--------|----------|---------------------------------|
-| quantity | number | Yes      | Integer ≥ 1                     |
-| gateway  | string | Yes      | `paystack`, `stripe`, `paypal`  |
+Sending `action: "initiate"` together with a `reference` is contradictory and
+returns `422`.
 
-**Success Response (201) – Paystack**
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `action` | string | No | `initiate` or `verify`. Inferred when omitted. |
+| `quantity` | number | initiate only | Integer ≥ 1 |
+| `gateway` | string | initiate only | `paystack`, `stripe`, `paypal` |
+| `reference` | string | verify only | The `SHR_…` reference from initiate |
+| `orderId` | string | No | PayPal only. Normally unnecessary — the order id is stored at initiate. |
+
+---
+
+#### Mode 1 — initiate
+
+**Request**
+```json
+{ "quantity": 5, "gateway": "paystack" }
+```
+
+**Response (201) — Paystack.** Redirect the user to `authorizationUrl`.
 ```json
 {
+  "statusCode": 201,
   "success": true,
   "message": "Payment initiated. Complete payment to receive shares.",
   "data": {
-    "paymentId": "...",
-    "reference": "SHR_ABC123XYZ",
+    "action": "initiate",
+    "paymentId": "VI6fGNUOoEvhhNxzNjBq",
+    "reference": "SHR_7A903BE5FC8B45B8",
     "amount": 100000,
+    "currency": "NGN",
     "quantity": 5,
     "gateway": "paystack",
-    "authorizationUrl": "https://checkout.paystack.com/...",
-    "publicKey": "pk_test_..."
+    "status": "pending",
+    "authorizationUrl": "https://checkout.paystack.com/7lvssc3qi9lxz6s",
+    "clientSecret": null,
+    "publicKey": "pk_test_...",
+    "orderId": null
   }
 }
 ```
 
-**Success Response (201) – Stripe**
+**Response (201) — Stripe.** Confirm `clientSecret` with Stripe.js on the client.
 ```json
 {
+  "statusCode": 201,
   "success": true,
   "data": {
+    "action": "initiate",
     "paymentId": "...",
     "reference": "SHR_...",
     "amount": 100000,
+    "currency": "NGN",
     "quantity": 5,
     "gateway": "stripe",
+    "status": "pending",
+    "authorizationUrl": null,
     "clientSecret": "pi_..._secret_...",
-    "publicKey": null
+    "publicKey": "pk_test_...",
+    "orderId": null
   }
 }
 ```
+> `publicKey` is `STRIPE_PUBLISHABLE_KEY`. If that env var is unset it comes back
+> `null` and Stripe.js cannot initialise — set it.
 
-**Success Response (201) – PayPal**
+**Response (201) — PayPal.** Redirect the user to `authorizationUrl`.
 ```json
 {
+  "statusCode": 201,
   "success": true,
   "data": {
+    "action": "initiate",
     "paymentId": "...",
     "reference": "SHR_...",
     "amount": 100000,
+    "currency": "NGN",
     "quantity": 5,
     "gateway": "paypal",
-    "authorizationUrl": "https://www.sandbox.paypal.com/..."
+    "status": "pending",
+    "authorizationUrl": "https://www.sandbox.paypal.com/checkoutnow?token=...",
+    "clientSecret": null,
+    "publicKey": null,
+    "orderId": "5O190127TN364715T"
   }
 }
 ```
 
 ---
 
-### 7.4 Verify Paystack Payment
-Call this after the user completes payment on Paystack (or use webhook).
+#### Mode 2 — verify
 
-```
-POST /shares/verify/paystack
-Authorization: Bearer <idToken>
+Call this when the user returns to your callback page (see §7.5), or after
+Stripe.js reports success. Keep the `reference` from the initiate response.
+
+**Request**
+```json
+{ "reference": "SHR_7A903BE5FC8B45B8" }
 ```
 
-**Body**
+Per gateway, verification re-checks the payment server-side: Paystack's
+transaction verify API, Stripe's PaymentIntent, or the PayPal order — and for
+PayPal an approved order is **captured** here, which is when the money actually
+moves.
+
+**Response (200)**
 ```json
 {
-  "reference": "SHR_ABC123XYZ"
-}
-```
-
-**Success Response (200)**
-```json
-{
+  "statusCode": 200,
   "success": true,
-  "message": "Payment verified and shares credited",
+  "message": "Payment verified successfully and shares credited",
   "data": {
-    "success": true,
-    "paymentId": "...",
-    "quantity": 5
+    "action": "verify",
+    "paymentId": "VI6fGNUOoEvhhNxzNjBq",
+    "reference": "SHR_7A903BE5FC8B45B8",
+    "status": "completed",
+    "quantity": 5,
+    "amount": 100000,
+    "currency": "NGN",
+    "gateway": "paystack",
+    "alreadyProcessed": false,
+    "shares": { "sharesOwned": 5, "totalInvested": 100000 },
+    "commissions": [
+      { "uid": "...", "level": 1, "amount": 15000, "skipped": false },
+      { "uid": "...", "level": 2, "amount": 5000, "skipped": false }
+    ]
   }
 }
 ```
 
+**`alreadyProcessed: true`** (still `200`) means the payment was already
+completed — usually because the webhook got there first. This is the normal,
+expected outcome, not an error. Shares are credited exactly once regardless of
+how many times you call verify, and `commissions` is `[]` because this call did
+not distribute them.
+
+**Errors**
+
+| Status | When |
+|---|---|
+| `400` | Gateway says the payment is not successful yet. `errors[0].message` carries the gateway's own status, e.g. `Gateway status: abandoned`. Safe to retry — the payment stays `pending` and the checkout link stays usable. |
+| `403` | The reference belongs to a different user. |
+| `404` | No payment with that reference. |
+| `422` | Validation — bad `reference` format, missing `quantity`/`gateway`, unknown `action`, or `action`/`reference` conflict. |
+| `502` | The gateway itself is unreachable or misconfigured (bad API key, network failure). Not your session — do **not** log the user out. |
+
+> A `400` from verify is not final. A user who has not finished paying yet gets
+> `400` with `Gateway status: abandoned`; they can still complete the payment on
+> the same link and a later verify will succeed.
+
 ---
+
+### 7.5 Payment callback (what your frontend must serve)
+
+The backend sends users to these URLs on your app (`FRONTEND_URL`), so the
+frontend needs routes for them:
+
+| URL | Sent by | What to do |
+|---|---|---|
+| `/payment/callback?gateway=paystack` | Paystack, after checkout | Read the stored `reference`, call `POST /shares/buy` with it |
+| `/payment/callback?gateway=paypal` | PayPal, after approval | Same — the stored `reference` is what matters |
+| `/payment/cancel` | PayPal, if the user cancels | Show a cancelled state; the payment stays `pending` |
+
+Paystack also appends its own `reference` and `trxref` query params; PayPal
+appends `token` (the order id) and `PayerID`. You can use them, but the
+`reference` you saved at initiate is the authoritative key for this API.
+
+**Recommended flow:** persist `reference` (e.g. `sessionStorage`) at initiate,
+then verify on return. Because both verify and the webhook converge on the same
+idempotent completion, it is safe to verify immediately, retry on `400`, and
+verify again later — the user can never be credited twice or charged twice.
+
+---
+
 
 ## 8. Wallet Endpoints
 
@@ -630,6 +764,11 @@ Authorization: Bearer <idToken>
   "data": {
     "balance": 15000,
     "totalReferralEarnings": 15000,
+    "sharesOwned": 5,
+    "totalInvested": 100000,
+    "pricePerShare": 20000,
+    "currentValue": 100000,
+    "totalReturns": 0,
     "recentCommissions": [
       {
         "id": "...",
@@ -647,21 +786,32 @@ Authorization: Bearer <idToken>
 
 ---
 
-### 8.2 Manual Deposit (Testing / Legacy)
+### 8.2 Manual Balance Credit (Admin only)
 ```
-POST /wallet/deposit
-Authorization: Bearer <idToken>
+POST /wallet/credit
+Authorization: Bearer <idToken>   ← must be an admin
 ```
 
 **Body**
 ```json
 {
   "amount": 50000,
-  "description": "Test deposit"
+  "uid": "target_user_uid",
+  "description": "Goodwill adjustment"
 }
 ```
 
-This also triggers referral commissions.
+`uid` is optional and defaults to the calling admin.
+
+> **Replaces the old `POST /wallet/deposit`.** That endpoint was open to any
+> authenticated user, so anyone could credit their own balance for free *and*
+> trigger real 15%/5% referral payouts to their upline on money that had never
+> been collected — then withdraw it. It is now admin-only, writes an audited
+> `admin_credit` transaction recording which admin performed it, and deliberately
+> pays **no** referral commissions.
+>
+> Referral commissions are earned from gateway-verified share purchases only
+> (`paymentService.completePayment`). There is no self-service deposit.
 
 ---
 
@@ -771,6 +921,25 @@ https://your-domain.com/api/v1/webhooks/stripe
 https://your-domain.com/api/v1/webhooks/paypal
 ```
 
+**Why these still exist alongside `POST /shares/buy`.** Verification via
+`/shares/buy` is client-driven, so it only happens if the user comes back to your
+app. Webhooks are the safety net for the user who pays and then closes the tab —
+they are the only thing that credits that purchase. Keep them configured.
+
+Both routes converge on the same idempotent completion logic, so a webhook and a
+client verify arriving at the same instant credit the shares once and pay each
+referral commission once. Verified against 6 simultaneous duplicate deliveries.
+
+| Provider | Events handled | Signature verification |
+|---|---|---|
+| Paystack | `charge.success` | HMAC-SHA512 of the body against `x-paystack-signature`, keyed on `PAYSTACK_SECRET_KEY` |
+| Stripe | `payment_intent.succeeded` | `stripe.webhooks.constructEvent` against `STRIPE_WEBHOOK_SECRET` (needs the raw body — this router is mounted before the JSON parser) |
+| PayPal | `CHECKOUT.ORDER.APPROVED`, `PAYMENT.CAPTURE.COMPLETED` | **None yet** — verify with the PayPal SDK before production |
+
+`CHECKOUT.ORDER.APPROVED` only means the payer approved the order; the webhook
+captures it before crediting anything, so shares are never issued against money
+that was not actually taken.
+
 ---
 
 ## 11. Business Rules
@@ -789,6 +958,10 @@ https://your-domain.com/api/v1/webhooks/paypal
 - User B (direct referrer) receives ₦15,000 (15%)
 - User A (2nd level) receives ₦5,000 (5%)
 
+Commissions are paid once per payment. Each commission document has a
+deterministic id (`<paymentId>_L1`, `<paymentId>_L2`), so replayed webhooks and
+repeated verify calls cannot double-credit a referrer.
+
 ---
 
 ## 12. Postman Testing Guide
@@ -801,6 +974,7 @@ https://your-domain.com/api/v1/webhooks/paypal
 | `refreshToken` | *(set after login/signup)*         |
 | `uid`          | *(set after login/signup)*         |
 | `referralCode` | *(set after signup)*               |
+| `reference`    | *(set from the initiate response)* |
 
 ### Recommended Test Order
 
@@ -810,14 +984,19 @@ https://your-domain.com/api/v1/webhooks/paypal
 4. `GET /auth/me`
 5. `GET /referrals/me`
 6. `GET /shares`
-7. `POST /shares/buy` (gateway: paystack)
-8. Complete payment → `POST /shares/verify/paystack`
-9. `GET /shares/me`
-10. `GET /wallet`
-11. `POST /withdrawals`
-12. `GET /withdrawals/me`
-13. Login as admin → `GET /withdrawals/pending`
-14. `PATCH /withdrawals/:id/process`
+7. `POST /shares/buy` with `{"quantity": 1, "gateway": "paystack"}` → save `reference`
+8. Open `authorizationUrl`, pay with the test card below
+9. `POST /shares/buy` with `{"reference": "{{reference}}"}` → shares credited
+10. `POST /shares/buy` with the same `reference` again → `200` with `alreadyProcessed: true`
+11. `GET /shares/me`
+12. `GET /wallet`
+13. `POST /withdrawals`
+14. `GET /withdrawals/me`
+15. Login as admin → `GET /withdrawals/pending`
+16. `PATCH /withdrawals/:id/process`
+
+> Step 9 before paying returns `400` with `Gateway status: abandoned` — that is
+> correct, and the payment stays payable.
 
 ### Paystack Test Card
 ```
@@ -834,16 +1013,17 @@ OTP: 123456
 
 | Code | Meaning                | When it happens                     |
 |------|------------------------|-------------------------------------|
-| 200  | Success                | GET, PATCH, successful actions      |
-| 201  | Created                | Signup, buy shares, withdrawal      |
-| 400  | Bad Request            | Invalid data, insufficient shares  |
+| 200  | Success                | GET, PATCH, verified payment        |
+| 201  | Created                | Signup, payment initiated, withdrawal |
+| 400  | Bad Request            | Invalid data, insufficient shares, payment not completed yet |
 | 401  | Unauthorized            | Missing/invalid token               |
-| 403  | Forbidden              | Wrong role or disabled account      |
+| 403  | Forbidden              | Wrong role, disabled account, or another user's payment |
 | 404  | Not Found              | Resource does not exist             |
 | 409  | Conflict               | Email already exists                |
 | 422  | Validation Error       | express-validator failures          |
 | 429  | Too Many Requests      | Rate limit exceeded                 |
 | 500  | Internal Server Error  | Unexpected server error             |
+| 502  | Bad Gateway            | Payment provider unreachable or misconfigured |
 
 ---
 

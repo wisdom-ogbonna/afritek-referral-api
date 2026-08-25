@@ -11,7 +11,11 @@ router.get('/', shareController.getShareInfo);
 
 // Protected
 router.get('/me', authenticate, shareController.getMyShares);
+
+// The single payment endpoint. Two modes, resolved from `action` (or inferred
+// from whether `reference` is present):
+//   { quantity, gateway }  → initiate
+//   { reference }          → verify, credit shares, pay commissions
 router.post('/buy', authenticate, buySharesValidator, validate, shareController.buyShares);
-router.post('/verify/paystack', authenticate, shareController.verifyPaystack);
 
 module.exports = router;

@@ -77,10 +77,7 @@ const resetPassword = asyncHandler(async (req, res) => {
 });
 
 const sendEmailVerification = asyncHandler(async (req, res) => {
-  const authHeader = req.headers.authorization;
-  const idToken = authHeader.split('Bearer ')[1];
-
-  await authService.sendEmailVerification(idToken);
+  await authService.sendEmailVerification(req.user.email);
 
   res
     .status(HTTP_STATUS.OK)

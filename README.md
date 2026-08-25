@@ -86,8 +86,7 @@ Server: `http://localhost:5000`
 |--------|--------------------|----------|--------------------------------------------------|
 | GET    | /                  | Public   | Total / remaining shares, price, value           |
 | GET    | /me                | Required | My shares owned + purchase history               |
-| POST   | /buy               | Required | Initiate purchase (choose gateway)               |
-| POST   | /verify/paystack   | Required | Manually verify Paystack payment                 |
+| POST   | /buy               | Required | **The single payment endpoint** — initiate *and* verify, all gateways |
 
 ### Withdrawals  `/api/v1/withdrawals`
 | Method | Endpoint         | Auth     | Description                          |
@@ -104,9 +103,19 @@ Server: `http://localhost:5000`
 | POST   | /stripe    | Stripe payment webhook     |
 | POST   | /paypal    | PayPal payment webhook     |
 
+Webhooks stay alongside `POST /shares/buy`: they are what credits a user who pays
+and then closes the tab. Both routes share the same idempotent completion, so
+shares are credited once and each commission paid once no matter how the two race.
+
 ---
 
-## Example: Buy Shares with Paystack
+## Example: Buy Shares
+
+`POST /shares/buy` is the only payment endpoint. It covers Paystack, Stripe and
+PayPal, and handles initiation, verification, share crediting, referral
+commissions and payment status. You call it **twice** per purchase.
+
+### 1. Initiate
 
 ```http
 POST /api/v1/shares/buy
@@ -119,42 +128,88 @@ Content-Type: application/json
 }
 ```
 
-**Response**
+**Response (201)**
 ```json
 {
+  "statusCode": 201,
   "success": true,
   "message": "Payment initiated. Complete payment to receive shares.",
   "data": {
+    "action": "initiate",
     "paymentId": "...",
-    "reference": "SHR_ABC123...",
+    "reference": "SHR_7A903BE5FC8B45B8",
     "amount": 100000,
+    "currency": "NGN",
     "quantity": 5,
     "gateway": "paystack",
+    "status": "pending",
     "authorizationUrl": "https://checkout.paystack.com/...",
-    "publicKey": "pk_test_..."
+    "clientSecret": null,
+    "publicKey": "pk_test_...",
+    "orderId": null
   }
 }
 ```
 
-Redirect the user to `authorizationUrl`. After payment, Paystack webhook (or `/verify/paystack`) credits the shares and pays the 15%/5% commissions.
+Save the `reference`, then send the user to pay:
 
-### Stripe
-```json
+| Gateway  | What to do with the response                          |
+|----------|-------------------------------------------------------|
+| Paystack | Redirect to `authorizationUrl`                        |
+| Stripe   | Confirm `clientSecret` with Stripe.js (`publicKey` = `STRIPE_PUBLISHABLE_KEY`) |
+| PayPal   | Redirect to `authorizationUrl` (`orderId` is stored server-side) |
+
+### 2. Verify
+
+Call the same endpoint with the saved `reference` when the user returns:
+
+```http
+POST /api/v1/shares/buy
+Authorization: Bearer <idToken>
+Content-Type: application/json
+
 {
-  "quantity": 2,
-  "gateway": "stripe"
+  "reference": "SHR_7A903BE5FC8B45B8"
 }
 ```
-Returns `clientSecret` → use Stripe.js on frontend.
 
-### PayPal
+**Response (200)**
 ```json
 {
-  "quantity": 10,
-  "gateway": "paypal"
+  "statusCode": 200,
+  "success": true,
+  "message": "Payment verified successfully and shares credited",
+  "data": {
+    "action": "verify",
+    "reference": "SHR_7A903BE5FC8B45B8",
+    "status": "completed",
+    "quantity": 5,
+    "alreadyProcessed": false,
+    "shares": { "sharesOwned": 5, "totalInvested": 100000 },
+    "commissions": [
+      { "uid": "...", "level": 1, "amount": 15000, "skipped": false },
+      { "uid": "...", "level": 2, "amount": 5000, "skipped": false }
+    ]
+  }
 }
 ```
-Returns `authorizationUrl` → redirect user.
+
+This step verifies with the gateway (and **captures** the PayPal order), credits
+the shares, pays the 15%/5% commissions and updates the payment status.
+
+Notes:
+- `action` is optional — omit it and the mode is inferred from whether you sent a
+  `reference`. Send `action: "initiate"` / `"verify"` if you prefer it explicit.
+- `alreadyProcessed: true` with `200` means the webhook got there first. Normal,
+  not an error.
+- `400` means the gateway has not seen the payment yet; the payment stays
+  `pending` and the link stays usable, so retrying is safe.
+- `502` means the gateway is unreachable or misconfigured — **not** an auth
+  problem, so don't log the user out.
+
+See [API_DOCUMENTATION.md](./API_DOCUMENTATION.md#73-buy-shares--the-single-payment-endpoint)
+for the full contract, including the `/payment/callback` routes your frontend
+needs to serve.
 
 ---
 

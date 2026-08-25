@@ -16,6 +16,7 @@ module.exports = {
     UNPROCESSABLE: 422,
     TOO_MANY_REQUESTS: 429,
     INTERNAL_SERVER: 500,
+    BAD_GATEWAY: 502,
   },
 
   MESSAGES: {
@@ -41,9 +42,16 @@ module.exports = {
     DEPOSIT_SUCCESS: 'Deposit successful and commissions distributed',
     INSUFFICIENT_SHARES: 'Not enough shares available',
     INSUFFICIENT_BALANCE: 'Insufficient wallet balance',
-    PAYMENT_INITIATED: 'Payment initiated successfully',
+    PAYMENT_INITIATED: 'Payment initiated. Complete payment to receive shares.',
+    PAYMENT_VERIFIED: 'Payment verified successfully and shares credited',
+    PAYMENT_ALREADY_PROCESSED: 'Payment has already been processed',
+    PAYMENT_NOT_COMPLETED: 'Payment has not been completed yet',
+    PAYMENT_NOT_FOUND: 'Payment not found',
+    PAYMENT_FORBIDDEN: 'This payment does not belong to you',
     WITHDRAWAL_REQUESTED: 'Withdrawal request submitted successfully',
     INVALID_GATEWAY: 'Unsupported payment gateway',
+    INVALID_ACTION: "action must be either 'initiate' or 'verify'",
+    ACTION_CONFLICT: "reference must not be sent when action is 'initiate'",
   },
 
   REFERRAL_RATES: {
@@ -63,9 +71,16 @@ module.exports = {
     PAYPAL: 'paypal',
   },
 
+  // The two modes of POST /shares/buy. Resolved from body.action when sent,
+  // otherwise inferred from whether a reference is present.
+  PAYMENT_ACTIONS: {
+    INITIATE: 'initiate',
+    VERIFY: 'verify',
+  },
+
   PAYMENT_STATUS: {
     PENDING: 'pending',
-    SUCCESS: 'success',
+    COMPLETED: 'completed',
     FAILED: 'failed',
     CANCELLED: 'cancelled',
   },

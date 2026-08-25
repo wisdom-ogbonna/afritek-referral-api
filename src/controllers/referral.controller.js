@@ -6,9 +6,11 @@ const { HTTP_STATUS } = require('../utils/constants');
 const getMyReferralStats = asyncHandler(async (req, res) => {
   const stats = await referralService.getReferralStats(req.user.uid);
 
-  // Build a ready-to-share referral link
-  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-  const referralLink = `${frontendUrl}/signup?ref=${stats.referralCode}`;
+  // Build a ready-to-share referral link. The path must match the frontend's
+  // signup route (AppRoutes uses /register, not /signup) or every shared link
+  // lands on the 404 page and the referral is silently lost.
+  const frontendUrl = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/+$/, '');
+  const referralLink = `${frontendUrl}/register?ref=${stats.referralCode}`;
 
   res.status(HTTP_STATUS.OK).json(
     new ApiResponse(
