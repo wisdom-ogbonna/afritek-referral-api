@@ -1,12 +1,13 @@
 {
   "name": "firebase-auth-referral-shares-api",
   "version": "2.0.0",
-  "description": "Production-ready Auth, 2-Level Referral, Share Purchase (1M shares @ ₦20k) with Paystack, Stripe & PayPal + Withdrawals",
+  "description": "Production-ready Auth, 2-Level Referral, Share Purchase (1M shares @ $20, USD-based ledger) with Paystack, Stripe & PayPal + Withdrawals",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "seed:shares": "node src/scripts/seedShares.js",
+    "reprice:ledger": "node src/scripts/repriceLedgerUsd.js",
     "test:email": "node src/scripts/testEmail.js",
     "check:referrals": "node scripts/checkReferralLogic.js"
   },

@@ -5,21 +5,28 @@ const {
   MESSAGES,
   WITHDRAWAL_STATUS,
   ROLES,
+  WITHDRAWAL,
 } = require('../utils/constants');
 const { logger } = require('../utils/logger');
 const { v4: uuidv4 } = require('uuid');
 
 class WithdrawalService {
   /**
-   * Request a withdrawal from wallet balance
+   * Request a withdrawal from wallet balance.
+   *
+   * Amounts here are USD, because the balance they come out of is: commissions
+   * are a percentage of a USD purchase total. The payout leg to a Nigerian bank
+   * account still has to convert to Naira — that conversion belongs to whoever
+   * processes the transfer, and the rate it settles at is recorded there, not
+   * assumed here.
    */
   async requestWithdrawal(uid, amount, bankDetails) {
-    const min = parseInt(process.env.MIN_WITHDRAWAL, 10) || 1000;
+    const min = WITHDRAWAL.MIN_USD;
 
     if (amount < min) {
       throw new ApiError(
         HTTP_STATUS.BAD_REQUEST,
-        `Minimum withdrawal amount is ₦${min}`
+        `Minimum withdrawal amount is $${min}`
       );
     }
 
@@ -37,9 +44,9 @@ class WithdrawalService {
       throw new ApiError(HTTP_STATUS.BAD_REQUEST, MESSAGES.INSUFFICIENT_BALANCE);
     }
 
-    const feePercent = parseFloat(process.env.WITHDRAWAL_FEE_PERCENT) || 0;
+    const feePercent = WITHDRAWAL.FEE_PERCENT;
     const fee = Number(((amount * feePercent) / 100).toFixed(2));
-    const netAmount = amount - fee;
+    const netAmount = Number((amount - fee).toFixed(2));
 
     const withdrawalId = uuidv4();
 
@@ -64,7 +71,7 @@ class WithdrawalService {
         amount,
         fee,
         netAmount,
-        currency: 'NGN',
+        currency: WITHDRAWAL.CURRENCY,
         bankDetails: {
           accountName: bankDetails.accountName,
           accountNumber: bankDetails.accountNumber,
@@ -77,13 +84,14 @@ class WithdrawalService {
       });
     });
 
-    logger.info(`Withdrawal requested: ${withdrawalId} by ${uid} for ₦${amount}`);
+    logger.info(`Withdrawal requested: ${withdrawalId} by ${uid} for $${amount}`);
 
     return {
       withdrawalId,
       amount,
       fee,
       netAmount,
+      currency: WITHDRAWAL.CURRENCY,
       status: WITHDRAWAL_STATUS.PENDING,
     };
   }

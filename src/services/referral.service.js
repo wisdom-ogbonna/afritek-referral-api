@@ -1,6 +1,6 @@
 const { db, FieldValue } = require('../config/firebase');
 const ApiError = require('../utils/ApiError');
-const { HTTP_STATUS, MESSAGES, REFERRAL_RATES } = require('../utils/constants');
+const { HTTP_STATUS, MESSAGES, REFERRAL_RATES, SHARES } = require('../utils/constants');
 const { logger } = require('../utils/logger');
 const maskEmail = require('../utils/maskEmail');
 const { v4: uuidv4 } = require('uuid');
@@ -108,6 +108,8 @@ class ReferralService {
         level2: earnings.level2,
         total: Number((earnings.level1 + earnings.level2).toFixed(2)),
       },
+      // Commissions are a cut of a USD purchase total, so earnings are USD.
+      currency: SHARES.CURRENCY,
       rates: {
         level1: `${REFERRAL_RATES.LEVEL_1}%`,
         level2: `${REFERRAL_RATES.LEVEL_2}%`,

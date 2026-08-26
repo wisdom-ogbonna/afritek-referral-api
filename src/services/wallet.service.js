@@ -1,7 +1,8 @@
 const { db, FieldValue } = require('../config/firebase');
 const ApiError = require('../utils/ApiError');
-const { HTTP_STATUS } = require('../utils/constants');
+const { HTTP_STATUS, SHARES } = require('../utils/constants');
 const { logger } = require('../utils/logger');
+const shareService = require('./share.service');
 const { v4: uuidv4 } = require('uuid');
 
 class WalletService {
@@ -47,7 +48,7 @@ class WalletService {
       });
     });
 
-    logger.warn(`Admin ${adminUid} credited ₦${amount} to ${targetUid} (tx ${txId})`);
+    logger.warn(`Admin ${adminUid} credited $${amount} to ${targetUid} (tx ${txId})`);
 
     const updatedUser = await userRef.get();
 
@@ -98,18 +99,23 @@ class WalletService {
       currentValue: sharesOwned * pricePerShare,
       // Unrealised gain on holdings — the "Total Returns" figure on the wallet tab.
       totalReturns: sharesOwned * pricePerShare - totalInvested,
+      // Every figure above is in this currency. Stated explicitly so the frontend
+      // renders what the ledger actually holds instead of assuming a symbol.
+      currency: SHARES.CURRENCY,
       recentCommissions,
     };
   }
 
   /**
-   * Live share price from config, so a price change is reflected everywhere
-   * rather than each caller baking in the seed-time constant.
+   * Live share price in USD.
+   *
+   * Delegates to shareService.getPriceUsd() rather than reading config/shares
+   * directly: that resolver is the one place the env price is reconciled with the
+   * stored doc, so going around it is how the wallet ends up valuing holdings at
+   * a price nobody is being charged.
    */
   async _currentSharePrice() {
-    const snap = await db.collection('config').doc('shares').get();
-    const { SHARES } = require('../utils/constants');
-    return snap.exists ? snap.data().pricePerShare || SHARES.PRICE : SHARES.PRICE;
+    return shareService.getPriceUsd();
   }
 }
 

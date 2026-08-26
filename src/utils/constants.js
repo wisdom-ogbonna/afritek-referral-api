@@ -17,6 +17,7 @@ module.exports = {
     TOO_MANY_REQUESTS: 429,
     INTERNAL_SERVER: 500,
     BAD_GATEWAY: 502,
+    SERVICE_UNAVAILABLE: 503,
   },
 
   MESSAGES: {
@@ -52,6 +53,9 @@ module.exports = {
     INVALID_GATEWAY: 'Unsupported payment gateway',
     INVALID_ACTION: "action must be either 'initiate' or 'verify'",
     ACTION_CONFLICT: "reference must not be sent when action is 'initiate'",
+    FX_UNAVAILABLE:
+      'Naira pricing is temporarily unavailable. Please try again shortly or pay by card.',
+    AMOUNT_MISMATCH: 'Amount paid does not match the order total. Please contact support.',
   },
 
   REFERRAL_RATES: {
@@ -61,8 +65,29 @@ module.exports = {
 
   SHARES: {
     TOTAL: parseInt(process.env.TOTAL_SHARES, 10) || 1000000,
-    PRICE: parseInt(process.env.SHARE_PRICE, 10) || 20000, // ₦20,000
-    CURRENCY: process.env.CURRENCY || 'NGN',
+
+    // USD is the pricing currency. Stripe and PayPal bill this figure directly;
+    // Paystack bills the NGN equivalent at the rate fxService resolves, pinned
+    // onto the payment at initiation. Never read a price from the client.
+    PRICE_USD: parseFloat(process.env.SHARE_PRICE_USD) || 20,
+    CURRENCY: process.env.CURRENCY || 'USD',
+
+    // A single order of the full 1,000,000-share supply would be $20,000,000,
+    // which exceeds the per-charge maximum at every gateway and only ever
+    // surfaces as an opaque 502. Bound it here instead.
+    MAX_PER_ORDER: parseInt(process.env.MAX_SHARES_PER_ORDER, 10) || 10000,
+  },
+
+  WITHDRAWAL: {
+    // Wallet balances are referral commissions, which are a percentage of a USD
+    // purchase total — so they are USD, and so is this floor.
+    //
+    // Deliberately a NEW env name rather than reusing MIN_WITHDRAWAL: that was
+    // ₦1,000, and reading the same value against a USD balance would silently
+    // become a $1,000 minimum that no referrer could ever reach.
+    MIN_USD: parseFloat(process.env.MIN_WITHDRAWAL_USD) || 10,
+    FEE_PERCENT: parseFloat(process.env.WITHDRAWAL_FEE_PERCENT) || 0,
+    CURRENCY: 'USD',
   },
 
   PAYMENT_GATEWAYS: {

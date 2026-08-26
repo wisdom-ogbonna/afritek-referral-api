@@ -112,7 +112,7 @@ router.post(
 
       if (reference) {
         try {
-          await paymentService.completePayment(reference, intent);
+          await paymentService.completeStripeIntent(reference);
           logger.info(`Stripe webhook: payment ${reference} completed`);
         } catch (err) {
           logger.error(`Stripe webhook error for ${reference}: ${err.message}`);

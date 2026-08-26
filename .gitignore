@@ -1,3 +1,5 @@
 node_modules/
-.env
-.env.example
+
+# Every env variant, including local backups like .env.bak-*.
+# .env.example is not tracked either — it lives only in the working copy.
+.env*

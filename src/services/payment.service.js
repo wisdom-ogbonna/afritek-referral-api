@@ -12,6 +12,7 @@ const {
 } = require('../utils/constants');
 const shareService = require('./share.service');
 const referralService = require('./referral.service');
+const fxService = require('./fx.service');
 const { logger } = require('../utils/logger');
 
 const stripe = process.env.STRIPE_SECRET_KEY
@@ -36,6 +37,13 @@ class PaymentService {
       throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Quantity must be a positive integer');
     }
 
+    if (quantity > SHARES.MAX_PER_ORDER) {
+      throw new ApiError(
+        HTTP_STATUS.BAD_REQUEST,
+        `A single order is limited to ${SHARES.MAX_PER_ORDER} shares`
+      );
+    }
+
     // Check remaining shares
     const info = await shareService.getShareInfo();
     if (info.remainingShares < quantity) {
@@ -45,10 +53,28 @@ class PaymentService {
       );
     }
 
-    const amount = quantity * SHARES.PRICE; // in Naira (kobo for Paystack)
+    // The ONE price, resolved server-side. `info.pricePerShare` comes from
+    // shareService.getPriceUsd(), which is also what GET /shares quotes to the
+    // buy screen — so what we charge and what the buyer was shown cannot drift.
+    // No price, amount, currency or rate is ever read from the request.
+    const priceUsd = info.pricePerShare;
+    const amountUsd = this._round2(quantity * priceUsd);
+
+    // What the gateway will actually collect. Stripe and PayPal bill USD
+    // directly; Paystack can only bill Naira, so it gets a converted figure at a
+    // rate resolved here and pinned onto the payment below.
+    const quote = await this._buildCharge(gateway, amountUsd);
+
     const reference = `SHR_${uuidv4().replace(/-/g, '').substring(0, 16).toUpperCase()}`;
 
-    // Create pending payment record
+    // Create pending payment record.
+    //
+    // amountUsd is the ledger figure (commissions, totalInvested, the purchase
+    // record). chargeAmount/chargeCurrency/fxRate are the PINNED quote: every
+    // verification path re-checks the money actually received against these,
+    // never against a freshly-recomputed price. That is what makes a rate move
+    // between initiate and verify harmless, and what makes tampering with the
+    // stored figures detectable rather than profitable.
     const paymentRef = db.collection('payments').doc();
     await paymentRef.set({
       id: paymentRef.id,
@@ -56,8 +82,17 @@ class PaymentService {
       email,
       fullName,
       quantity,
-      amount,
-      currency: SHARES.CURRENCY,
+      pricePerShareUsd: priceUsd,
+      amountUsd,
+      // `amount`/`currency` are kept as aliases of the ledger figure so older
+      // readers (and the purchases/commissions paths) keep working.
+      amount: amountUsd,
+      currency: 'USD',
+      chargeAmount: quote.chargeAmount,
+      chargeCurrency: quote.chargeCurrency,
+      fxRate: quote.fxRate,
+      fxSource: quote.fxSource,
+      quotedAt: FieldValue.serverTimestamp(),
       gateway,
       reference,
       status: PAYMENT_STATUS.PENDING,
@@ -68,14 +103,18 @@ class PaymentService {
     let paymentData;
 
     switch (gateway) {
+      // Each gateway is handed the whole `quote`, never a bare number. The
+      // currency it bills in comes from quote.chargeCurrency, which is the same
+      // field verification compares against — so "what we pinned" and "what we
+      // charged" cannot drift apart through a mislabelled argument.
       case PAYMENT_GATEWAYS.PAYSTACK:
-        paymentData = await this._initPaystack(email, amount, reference, paymentRef.id, quantity);
+        paymentData = await this._initPaystack(email, quote, reference, paymentRef.id, quantity);
         break;
       case PAYMENT_GATEWAYS.STRIPE:
-        paymentData = await this._initStripe(email, amount, reference, paymentRef.id, quantity);
+        paymentData = await this._initStripe(email, quote, reference, paymentRef.id, quantity);
         break;
       case PAYMENT_GATEWAYS.PAYPAL:
-        paymentData = await this._initPaypal(email, amount, reference, paymentRef.id, quantity);
+        paymentData = await this._initPaypal(email, quote, reference, paymentRef.id, quantity);
         break;
       default:
         throw new ApiError(HTTP_STATUS.BAD_REQUEST, MESSAGES.INVALID_GATEWAY);
@@ -92,14 +131,28 @@ class PaymentService {
       updatedAt: FieldValue.serverTimestamp(),
     });
 
-    logger.info(`Payment initiated: ${reference} via ${gateway} for ${quantity} shares`);
+    logger.info(
+      `Payment initiated: ${reference} via ${gateway} for ${quantity} shares — ` +
+        `$${amountUsd} charged as ${quote.chargeCurrency} ${quote.chargeAmount}` +
+        (quote.fxRate ? ` @ ${quote.fxRate} (${quote.fxSource})` : '')
+    );
 
     return {
       paymentId: paymentRef.id,
       reference,
-      amount,
-      currency: SHARES.CURRENCY,
       quantity,
+      pricePerShareUsd: priceUsd,
+      amountUsd,
+      // The figure and currency the buyer will actually be debited in. The buy
+      // screen shows these for Paystack so a Naira payer sees the exact charge
+      // and the rate behind it before committing.
+      chargeAmount: quote.chargeAmount,
+      chargeCurrency: quote.chargeCurrency,
+      fxRate: quote.fxRate,
+      // Legacy aliases — `amount` used to be the charge figure. Kept pointing at
+      // the charge so existing clients still display what will be debited.
+      amount: quote.chargeAmount,
+      currency: quote.chargeCurrency,
       gateway,
       status: PAYMENT_STATUS.PENDING,
       authorizationUrl: paymentData.authorizationUrl || null,
@@ -190,6 +243,15 @@ class PaymentService {
       reference: payment.reference,
       status: payment.status,
       quantity: payment.quantity,
+      // The ledger figure — USD, and what totalInvested/commissions moved by.
+      pricePerShareUsd: payment.pricePerShareUsd ?? null,
+      amountUsd: payment.amountUsd ?? payment.amount,
+      // What the buyer was actually debited. Equal to the USD figure for the card
+      // gateways; the pinned Naira total for Paystack.
+      chargeAmount: payment.chargeAmount ?? payment.amount,
+      chargeCurrency: payment.chargeCurrency ?? payment.currency,
+      fxRate: payment.fxRate ?? null,
+      // Legacy aliases, kept pointing where they always did.
       amount: payment.amount,
       currency: payment.currency,
       gateway: payment.gateway,
@@ -259,9 +321,9 @@ class PaymentService {
   }
 
   /**
-   * Paystack initialize
+   * Paystack initialize. Bills `quote.chargeAmount` whole Naira as kobo.
    */
-  async _initPaystack(email, amountNaira, reference, paymentId, quantity) {
+  async _initPaystack(email, quote, reference, paymentId, quantity) {
     const secret = process.env.PAYSTACK_SECRET_KEY;
     if (!secret) throw new ApiError(HTTP_STATUS.INTERNAL_SERVER, 'Paystack not configured');
 
@@ -270,13 +332,17 @@ class PaymentService {
         `${PAYSTACK_BASE}/transaction/initialize`,
         {
           email,
-          amount: amountNaira * 100, // kobo
+          amount: Math.round(quote.chargeAmount * 100), // kobo
           reference,
-          currency: 'NGN',
+          currency: quote.chargeCurrency,
           callback_url: `${process.env.FRONTEND_URL}/payment/callback?gateway=paystack`,
           metadata: {
             paymentId,
             quantity,
+            // Provenance for reconciliation: the USD order this Naira charge came
+            // from, and the rate it was priced at.
+            amountUsd: quote.amountUsd,
+            fxRate: quote.fxRate,
             custom_fields: [
               { display_name: 'Shares', variable_name: 'shares', value: quantity },
             ],
@@ -344,55 +410,44 @@ class PaymentService {
 
   /**
    * A successful Paystack transaction must also have collected the full amount
-   * for this payment. Paystack reports kobo; we store Naira.
+   * for this payment. Paystack reports kobo; the pinned quote is whole Naira.
    *
    * Without this, a transaction marked successful for less than the order value
    * would still credit the full share quantity.
+   *
+   * The comparison is against `payment.chargeAmount` (Naira), NOT
+   * `payment.amount` — that is now the USD ledger figure, and comparing a kobo
+   * total against it would treat a $60 order as if ₦60 settled it.
    */
   _assertPaystackAmount(payment, data) {
-    const expectedKobo = Math.round(payment.amount * 100);
-    const paidKobo = Number(data.amount);
+    const paidNaira = Number(data.amount) / 100;
 
-    if (!Number.isFinite(paidKobo) || paidKobo < expectedKobo) {
-      logger.error(
-        `Paystack amount mismatch on ${payment.reference}: paid ${paidKobo} kobo, expected ${expectedKobo}`
-      );
-      throw new ApiError(
-        HTTP_STATUS.BAD_REQUEST,
-        'Amount paid does not match the order total. Please contact support.',
-        [{ field: 'amount', message: `Expected ₦${payment.amount}` }]
-      );
-    }
-
-    const paidCurrency = (data.currency || SHARES.CURRENCY).toUpperCase();
-    if (paidCurrency !== SHARES.CURRENCY.toUpperCase()) {
-      logger.error(
-        `Paystack currency mismatch on ${payment.reference}: ${paidCurrency} != ${SHARES.CURRENCY}`
-      );
-      throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Payment currency does not match the order');
-    }
+    this._assertChargeCovered('Paystack', payment, paidNaira, data.currency);
   }
 
   /**
-   * Stripe PaymentIntent (amount converted roughly; for real use convert NGN→USD)
+   * Stripe PaymentIntent. Bills the USD order total directly — no conversion.
+   *
+   * The currency is `quote.chargeCurrency`, NOT the old STRIPE_CURRENCY env var:
+   * that var could be set to anything, and billing €20 for a $20 share would
+   * then also fail the amount check at verification. The pinned quote is the
+   * single source for both the figure and the currency.
    */
-  async _initStripe(email, amountNaira, reference, paymentId, quantity) {
+  async _initStripe(email, quote, reference, paymentId, quantity) {
     if (!stripe) throw new ApiError(HTTP_STATUS.INTERNAL_SERVER, 'Stripe not configured');
 
-    // FX rate is configuration, not a literal buried in two different methods —
-    // a stale hardcoded rate silently under- or over-charges every card payer.
-    const amountUsdCents = Math.round((amountNaira / this._ngnPerUsd()) * 100);
+    const amountMinor = Math.round(quote.chargeAmount * 100); // cents
 
     const paymentIntent = await this._gatewayCall('Stripe', 'payment intent creation', () =>
       stripe.paymentIntents.create({
-        amount: amountUsdCents,
-        currency: process.env.STRIPE_CURRENCY || 'usd',
+        amount: amountMinor,
+        currency: quote.chargeCurrency.toLowerCase(),
         receipt_email: email,
         metadata: {
           reference,
           paymentId,
           quantity: String(quantity),
-          originalAmountNGN: String(amountNaira),
+          amountUsd: String(quote.amountUsd),
         },
         automatic_payment_methods: { enabled: true },
       })
@@ -425,6 +480,15 @@ class PaymentService {
     );
 
     if (intent.status === 'succeeded') {
+      // `amount_received` is what actually settled, which is not necessarily
+      // `amount` — a partial capture succeeds with less. Check the former.
+      this._assertChargeCovered(
+        'Stripe',
+        payment,
+        Number(intent.amount_received) / 100,
+        intent.currency
+      );
+
       return { paid: true, payload: intent, gatewayStatus: intent.status };
     }
 
@@ -438,13 +502,10 @@ class PaymentService {
   }
 
   /**
-   * PayPal order
+   * PayPal order. Bills the USD order total directly — no conversion.
    */
-  async _initPaypal(email, amountNaira, reference, paymentId, quantity) {
+  async _initPaypal(email, quote, reference, paymentId, quantity) {
     const accessToken = await this._getPaypalAccessToken();
-
-    // Convert to USD for PayPal
-    const amountUsd = (amountNaira / this._ngnPerUsd()).toFixed(2);
 
     const response = await this._gatewayCall('PayPal', 'order creation', () =>
       axios.post(
@@ -456,8 +517,8 @@ class PaymentService {
               reference_id: reference,
               description: `${quantity} Share(s)`,
               amount: {
-                currency_code: 'USD',
-                value: amountUsd,
+                currency_code: quote.chargeCurrency,
+                value: quote.chargeAmount.toFixed(2),
               },
               custom_id: paymentId,
             },
@@ -505,6 +566,7 @@ class PaymentService {
     }
 
     if (order.status === 'COMPLETED') {
+      this._assertPaypalAmount(payment, order);
       return { paid: true, payload: order, gatewayStatus: order.status };
     }
 
@@ -515,6 +577,49 @@ class PaymentService {
       reason: `PayPal order status is ${order.status}`,
       payload: order,
     };
+  }
+
+  /**
+   * A COMPLETED PayPal order must also have captures totalling the pinned quote.
+   *
+   * The order's own `amount` is only what we asked for; the captures are what
+   * PayPal actually took. Those are the figures worth checking, and they are
+   * summed because a single order can be captured in parts.
+   */
+  _assertPaypalAmount(payment, order) {
+    const captures = (order.purchase_units || []).flatMap(
+      (unit) => unit.payments?.captures || []
+    );
+
+    const completed = captures.filter((c) => String(c.status).toUpperCase() === 'COMPLETED');
+
+    if (!completed.length) {
+      // COMPLETED with no readable captures means the money cannot be confirmed.
+      // Refuse rather than credit shares on the strength of a status string.
+      logger.error(
+        `PayPal order for ${payment.reference} is COMPLETED but exposes no completed captures`
+      );
+      throw new ApiError(HTTP_STATUS.BAD_REQUEST, MESSAGES.AMOUNT_MISMATCH, [
+        { field: 'amount', message: 'PayPal reported no completed capture for this order' },
+      ]);
+    }
+
+    // Mixed capture currencies cannot be summed; _assertChargeCovered would then
+    // compare a meaningless total against the expectation.
+    const currencies = new Set(
+      completed.map((c) => String(c.amount?.currency_code || '').toUpperCase())
+    );
+
+    if (currencies.size > 1) {
+      logger.error(
+        `PayPal captures for ${payment.reference} span multiple currencies: ${[...currencies].join(', ')}`
+      );
+      throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Payment currency does not match the order');
+    }
+
+    const paid = completed.reduce((sum, c) => sum + (Number(c.amount?.value) || 0), 0);
+
+    this._assertChargeCovered('PayPal', payment, paid, [...currencies][0]);
   }
 
   async _getPaypalOrder(orderId) {
@@ -580,11 +685,113 @@ class PaymentService {
   }
 
   /**
-   * NGN per 1 USD, used for the card gateways that cannot charge in Naira.
+   * Round to whole cents. Share quantities are integers and the price is a
+   * 2dp USD figure, but float multiplication still yields 60.000000000000004,
+   * which would then fail an exact amount comparison at verification.
    */
-  _ngnPerUsd() {
-    const rate = parseFloat(process.env.NGN_PER_USD);
-    return Number.isFinite(rate) && rate > 0 ? rate : 1600;
+  _round2(value) {
+    return Math.round(value * 100) / 100;
+  }
+
+  /**
+   * Decide what the gateway will actually collect for a USD order total.
+   *
+   * Stripe and PayPal bill USD, so the charge IS the order total. Paystack can
+   * only bill Naira, so it gets amountUsd converted at a server-resolved rate.
+   * The returned figures are pinned onto the payment doc and are what every
+   * verification path later compares the received money against.
+   */
+  async _buildCharge(gateway, amountUsd) {
+    if (gateway !== PAYMENT_GATEWAYS.PAYSTACK) {
+      return {
+        amountUsd,
+        chargeAmount: amountUsd,
+        chargeCurrency: 'USD',
+        fxRate: null,
+        fxSource: null,
+      };
+    }
+
+    // Throws 503 if no rate can be justified — a Naira charge is never priced
+    // off a guess. See fx.service.js.
+    const fx = await fxService.getUsdToNgnRate();
+
+    return {
+      amountUsd,
+      // Whole Naira. Paystack is then charged this × 100 kobo, so rounding here
+      // keeps the kobo figure integral and the two consistent.
+      chargeAmount: Math.round(amountUsd * fx.rate),
+      chargeCurrency: 'NGN',
+      fxRate: fx.rate,
+      fxSource: fx.source,
+    };
+  }
+
+  /**
+   * What this payment's gateway was told to collect, and in which currency.
+   *
+   * Prefers the quote pinned at initiation. Falls back to the legacy
+   * `amount`/`currency` pair for payments created before the USD reprice: those
+   * were stored as the Naira charge figure, and some may still have been in
+   * flight when this deployed. Without the fallback their verification would
+   * compare a Naira payment against an absent expectation and reject it.
+   */
+  _expectedCharge(payment) {
+    if (Number.isFinite(payment.chargeAmount) && payment.chargeCurrency) {
+      return {
+        amount: payment.chargeAmount,
+        currency: String(payment.chargeCurrency).toUpperCase(),
+        legacy: false,
+      };
+    }
+
+    return {
+      amount: Number(payment.amount),
+      currency: String(payment.currency || 'NGN').toUpperCase(),
+      legacy: true,
+    };
+  }
+
+  /**
+   * Assert that the money a gateway actually collected covers the pinned quote.
+   *
+   * Shared by all three gateways so none of them can quietly skip the check.
+   * Comparison is in minor units (kobo/cents) as integers — comparing 2dp floats
+   * would make 59.999999999999996 < 60 and reject a correct payment.
+   *
+   * Underpayment is the failure being guarded against; overpayment is allowed
+   * through (the buyer is not harmed, and the shares credited are still the
+   * quantity that was quoted).
+   */
+  _assertChargeCovered(gateway, payment, paidAmount, paidCurrency) {
+    const expected = this._expectedCharge(payment);
+    const normalisedPaidCurrency = String(paidCurrency || expected.currency).toUpperCase();
+
+    if (normalisedPaidCurrency !== expected.currency) {
+      logger.error(
+        `${gateway} currency mismatch on ${payment.reference}: ` +
+          `paid ${normalisedPaidCurrency}, expected ${expected.currency}`
+      );
+      throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Payment currency does not match the order', [
+        { field: 'currency', message: `Expected ${expected.currency}` },
+      ]);
+    }
+
+    const expectedMinor = Math.round(expected.amount * 100);
+    const paidMinor = Math.round(Number(paidAmount) * 100);
+
+    if (!Number.isFinite(paidMinor) || paidMinor < expectedMinor) {
+      logger.error(
+        `${gateway} amount mismatch on ${payment.reference}: ` +
+          `paid ${paidAmount} ${normalisedPaidCurrency}, expected ${expected.amount}`
+      );
+      throw new ApiError(HTTP_STATUS.BAD_REQUEST, MESSAGES.AMOUNT_MISMATCH, [
+        {
+          field: 'amount',
+          message: `Expected ${expected.currency} ${expected.amount}`,
+        },
+      ]);
+    }
   }
 
   async _getPaypalAccessToken() {
@@ -785,10 +992,46 @@ class PaymentService {
   }
 
   /**
+   * Webhook entry point for Stripe.
+   *
+   * Like the Paystack one, this deliberately ignores the amounts in the event
+   * body and re-reads the PaymentIntent from Stripe instead, so `_verifyStripe`
+   * runs its amount/currency check on this path too. Fulfilling straight from the
+   * event object would credit shares without that check — a partial capture, or
+   * an intent whose amount no longer matches the pinned quote, would slip past.
+   */
+  async completeStripeIntent(reference) {
+    const paymentDoc = await this._findPaymentByReference(reference);
+    const payment = paymentDoc.data();
+
+    if (payment.status === PAYMENT_STATUS.COMPLETED) {
+      return { alreadyProcessed: true, paymentId: paymentDoc.id, commissions: [] };
+    }
+
+    const outcome = await this._verifyStripe(payment);
+
+    if (!outcome.paid) {
+      throw new ApiError(
+        HTTP_STATUS.BAD_REQUEST,
+        `Stripe reports ${outcome.gatewayStatus || 'an unpaid intent'} for ${reference}`
+      );
+    }
+
+    return this.completePayment(reference, outcome.payload);
+  }
+
+  /**
    * Webhook entry point for PayPal: capture the order first so an APPROVED-only
    * order never credits shares against money that was never taken.
    */
   async completePaypalOrder(orderId, reference) {
+    const paymentDoc = await this._findPaymentByReference(reference);
+    const payment = paymentDoc.data();
+
+    if (payment.status === PAYMENT_STATUS.COMPLETED) {
+      return { alreadyProcessed: true, paymentId: paymentDoc.id, commissions: [] };
+    }
+
     let order = await this._getPaypalOrder(orderId);
 
     if (order.status === 'APPROVED') {
@@ -801,6 +1044,11 @@ class PaymentService {
         `PayPal order ${orderId} is ${order.status}, not COMPLETED`
       );
     }
+
+    // The webhook path fulfils without going through _verifyPaypal, so the
+    // captured total has to be checked here too — otherwise a PayPal event is a
+    // way to credit shares while skipping the amount check entirely.
+    this._assertPaypalAmount(payment, order);
 
     return this.completePayment(reference, order);
   }
