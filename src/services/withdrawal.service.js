@@ -125,7 +125,20 @@ class WithdrawalService {
   }
 
   /**
-   * Admin: approve or reject
+   * Admin: approve or reject.
+   *
+   * The status check happens INSIDE the transaction, and that placement is the
+   * whole point. It used to run against a snapshot read beforehand, while the
+   * refund ran in a transaction of its own — so two admins rejecting the same
+   * request at the same time both read `pending`, both passed the guard, and both
+   * credited `+amount` back to the user. The balance was refunded twice for one
+   * withdrawal. Reading the doc through `tx` makes Firestore retry or abort the
+   * loser instead.
+   *
+   * Approve does not move money: the balance was already debited as a hold when
+   * the request was made, so approving only records that the payout happened.
+   * The bank transfer itself is performed out of band — nothing here talks to a
+   * gateway, and `processedBy`/`processedAt`/`note` are the audit trail for it.
    */
   async processWithdrawal(withdrawalId, action, adminUid, note = '') {
     if (!['approve', 'reject'].includes(action)) {
@@ -133,51 +146,56 @@ class WithdrawalService {
     }
 
     const wRef = db.collection('withdrawals').doc(withdrawalId);
-    const wSnap = await wRef.get();
+    const rejecting = action === 'reject';
+    const status = rejecting ? WITHDRAWAL_STATUS.REJECTED : WITHDRAWAL_STATUS.COMPLETED;
 
-    if (!wSnap.exists) {
-      throw new ApiError(HTTP_STATUS.NOT_FOUND, 'Withdrawal not found');
-    }
+    const result = await db.runTransaction(async (tx) => {
+      const wSnap = await tx.get(wRef);
 
-    const withdrawal = wSnap.data();
+      if (!wSnap.exists) {
+        throw new ApiError(HTTP_STATUS.NOT_FOUND, 'Withdrawal not found');
+      }
 
-    if (withdrawal.status !== WITHDRAWAL_STATUS.PENDING) {
-      throw new ApiError(HTTP_STATUS.BAD_REQUEST, 'Withdrawal already processed');
-    }
+      const withdrawal = wSnap.data();
 
-    if (action === 'reject') {
-      // Refund balance
-      await db.runTransaction(async (tx) => {
-        tx.update(wRef, {
-          status: WITHDRAWAL_STATUS.REJECTED,
-          processedBy: adminUid,
-          processedAt: FieldValue.serverTimestamp(),
-          note,
-          updatedAt: FieldValue.serverTimestamp(),
-        });
+      if (withdrawal.status !== WITHDRAWAL_STATUS.PENDING) {
+        throw new ApiError(
+          HTTP_STATUS.BAD_REQUEST,
+          MESSAGES.WITHDRAWAL_ALREADY_PROCESSED
+        );
+      }
 
-        const userRef = db.collection('users').doc(withdrawal.uid);
-        tx.update(userRef, {
+      tx.update(wRef, {
+        status,
+        processedBy: adminUid,
+        processedAt: FieldValue.serverTimestamp(),
+        note,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      if (rejecting) {
+        // Release the hold taken in requestWithdrawal().
+        tx.update(db.collection('users').doc(withdrawal.uid), {
           balance: FieldValue.increment(withdrawal.amount),
           updatedAt: FieldValue.serverTimestamp(),
         });
-      });
+      }
 
-      return { status: WITHDRAWAL_STATUS.REJECTED };
-    }
-
-    // Approve → mark as completed (in real system you would trigger Paystack Transfer here)
-    await wRef.update({
-      status: WITHDRAWAL_STATUS.COMPLETED,
-      processedBy: adminUid,
-      processedAt: FieldValue.serverTimestamp(),
-      note,
-      updatedAt: FieldValue.serverTimestamp(),
+      return {
+        status,
+        uid: withdrawal.uid,
+        amount: withdrawal.amount,
+        netAmount: withdrawal.netAmount,
+        currency: withdrawal.currency || WITHDRAWAL.CURRENCY,
+      };
     });
 
-    logger.info(`Withdrawal ${withdrawalId} approved by ${adminUid}`);
+    logger.info(
+      `Withdrawal ${withdrawalId} ${status} by ${adminUid}` +
+        (rejecting ? ` — $${result.amount} returned to ${result.uid}` : '')
+    );
 
-    return { status: WITHDRAWAL_STATUS.COMPLETED };
+    return result;
   }
 }
 

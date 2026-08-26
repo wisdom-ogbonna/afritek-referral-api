@@ -1,8 +1,23 @@
 module.exports = {
   ROLES: {
+    SUPER_ADMIN: 'super_admin',
     ADMIN: 'admin',
     MODERATOR: 'moderator',
     USER: 'user',
+  },
+
+  // Privilege ordering for `authorize()`. A caller passes when their rank is at
+  // least the lowest rank the route names, which is what lets super_admin
+  // inherit every admin route without being listed on each one.
+  //
+  // This replaced a hardcoded `role === 'admin'` bypass inside the middleware.
+  // That bypass let a plain admin satisfy authorize(SUPER_ADMIN), which would
+  // have made the two roles indistinguishable in practice.
+  ROLE_RANK: {
+    user: 0,
+    moderator: 1,
+    admin: 2,
+    super_admin: 3,
   },
 
   HTTP_STATUS: {
@@ -56,6 +71,14 @@ module.exports = {
     FX_UNAVAILABLE:
       'Naira pricing is temporarily unavailable. Please try again shortly or pay by card.',
     AMOUNT_MISMATCH: 'Amount paid does not match the order total. Please contact support.',
+
+    // Admin console
+    SUPER_ADMIN_ONLY: 'This action requires a super admin',
+    CANNOT_MODIFY_SELF: 'You cannot perform this action on your own account',
+    CANNOT_MODIFY_SUPER_ADMIN: 'Only a super admin can modify another super admin',
+    LAST_SUPER_ADMIN: 'Cannot remove the last remaining super admin',
+    INVALID_ROLE: 'Unknown role',
+    WITHDRAWAL_ALREADY_PROCESSED: 'Withdrawal already processed',
   },
 
   REFERRAL_RATES: {

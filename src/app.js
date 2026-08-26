@@ -11,6 +11,7 @@ const referralRoutes = require('./routes/referral.routes');
 const walletRoutes = require('./routes/wallet.routes');
 const shareRoutes = require('./routes/share.routes');
 const withdrawalRoutes = require('./routes/withdrawal.routes');
+const adminRoutes = require('./routes/admin.routes');
 const paymentWebhooks = require('./webhooks/payment.webhook');
 
 const app = express();
@@ -72,6 +73,9 @@ app.use(`${apiPrefix}/referrals`, referralRoutes);
 app.use(`${apiPrefix}/wallet`, walletRoutes);
 app.use(`${apiPrefix}/shares`, shareRoutes);
 app.use(`${apiPrefix}/withdrawals`, withdrawalRoutes);
+// Staff console (afritek-admin). The router applies authenticate + authorize
+// to every route in it, so nothing here is reachable by a normal user.
+app.use(`${apiPrefix}/admin`, adminRoutes);
 
 // 404 handler
 app.use(notFound);

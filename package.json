@@ -7,6 +7,7 @@
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "seed:shares": "node src/scripts/seedShares.js",
+    "create:superadmin": "node src/scripts/createSuperAdmin.js",
     "reprice:ledger": "node src/scripts/repriceLedgerUsd.js",
     "test:email": "node src/scripts/testEmail.js",
     "check:referrals": "node scripts/checkReferralLogic.js"
